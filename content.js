@@ -1,4 +1,5 @@
 const browserApi = typeof browser !== 'undefined' ? browser : chrome;
+console.log('[Signergy] content script v5.1 loaded');
 
 let signQueue = [];
 let isDisplaying = false;
@@ -13,6 +14,13 @@ const BASE_PATH_IN_REPO = "Signergy/Signs";
 
 let captionDebounceTimer = null;
 let transcriptHistory = "";
+
+// Sync sign playback with the host video's play/pause state.
+let mainVideo = null;
+let isPaused = false;
+let advanceTimer = null;
+let advanceDeadline = 0;
+let advanceRemaining = 0;
 
 function initializeOverlay() {
     if (document.getElementById('sign-language-overlay')) return;
@@ -129,7 +137,7 @@ function processNewText(text) {
         });
     }
 
-    if (!isDisplaying) {
+    if (!isDisplaying && !isPaused) {
         displayNextSign();
     }
 }
@@ -139,7 +147,52 @@ function addSignToQueue(key, category) {
     if (fileName) {
         const url = `https://raw.githubusercontent.com/${dictionary._repo_user}/${dictionary._repo_name}/main/${BASE_PATH_IN_REPO}/${category}/${fileName}`;
         signQueue.push({ key, fileName, url, category });
+        console.log(`[Signergy] queued ${category}: "${key}" -> ${fileName} (queue=${signQueue.length})`);
     }
+}
+
+// Attach play/pause listeners to the host video so signs freeze when it pauses.
+function hookMainVideo() {
+    const v = document.querySelector('video.html5-main-video') || document.querySelector('video');
+    if (!v || v === mainVideo) return;
+    mainVideo = v;
+    isPaused = v.paused;
+    v.addEventListener('pause', onMainPause);
+    v.addEventListener('play', onMainPlay);
+    console.log('[Signergy] hooked host video (paused=' + isPaused + ')');
+}
+
+function onMainPause() {
+    if (isPaused) return;
+    isPaused = true;
+    if (signVideo && !signVideo.paused) signVideo.pause();
+    if (advanceTimer) {
+        clearTimeout(advanceTimer);
+        advanceTimer = null;
+        advanceRemaining = Math.max(0, advanceDeadline - performance.now());
+    }
+    console.log('[Signergy] host paused — signs frozen');
+}
+
+function onMainPlay() {
+    if (!isPaused) return;
+    isPaused = false;
+    if (signVideo && signVideo.style.display === 'block' && signVideo.src && signVideo.paused) {
+        signVideo.play().catch(() => {});
+    }
+    if (isDisplaying && advanceRemaining > 0) {
+        scheduleAdvance(advanceRemaining);
+    } else {
+        displayNextSign();
+    }
+    console.log('[Signergy] host resumed — signs playing');
+}
+
+function scheduleAdvance(delay) {
+    clearTimeout(advanceTimer);
+    advanceRemaining = delay;
+    advanceDeadline = performance.now() + delay;
+    advanceTimer = setTimeout(() => { advanceTimer = null; displayNextSign(); }, delay);
 }
 
 function displayNextSign() {
@@ -147,6 +200,9 @@ function displayNextSign() {
         isDisplaying = false;
         return;
     }
+
+    // Hold on the current frame while the host video is paused.
+    if (isPaused) return;
 
     if (signQueue.length === 0) {
         isDisplaying = false;
@@ -173,18 +229,25 @@ function displayNextSign() {
         debugText.style.display = 'block';
     }
 
+    console.log(`[Signergy] playing ${sign.category}: ${sign.fileName}`);
     const onVideoReady = () => {
-        signVideo.play().catch(e => console.error("Video play failed:", e));
         const durationInSeconds = signVideo.duration / signVideo.playbackRate;
+        const delay = sign.category === 'letters'
+            ? (durationInSeconds * 1000) * 0.5
+            : (durationInSeconds * 1000) + 200;
 
-        if (sign.category === 'letters') {
-            setTimeout(displayNextSign, (durationInSeconds * 1000) * 0.5); 
-        } else {
-            setTimeout(displayNextSign, (durationInSeconds * 1000) + 200);
+        // If the host paused while this sign was loading, freeze here; onMainPlay resumes.
+        if (isPaused) {
+            signVideo.pause();
+            advanceRemaining = delay;
+            return;
         }
+
+        signVideo.play().catch(e => console.error("[Signergy] Video play failed:", e));
+        scheduleAdvance(delay);
     };
     const onVideoError = () => {
-        console.error(`Failed to load video: ${sign.fileName}`);
+        console.error(`[Signergy] Failed to load video: ${sign.fileName} (${sign.url})`);
         displayNextSign();
     };
 
@@ -193,67 +256,103 @@ function displayNextSign() {
     signVideo.src = sign.url;
 }
 
-function startObserver() {
-    let captionContainer = null;
-    let site = '';
+let observedNode = null;
+let currentSite = '';
+let captionWatchStarted = false;
+
+function findCaptionContainer() {
     const hostname = window.location.hostname;
 
     if (hostname === 'www.youtube.com') {
-        captionContainer = document.querySelector('.ytp-caption-window-container');
-        site = 'youtube-desktop';
+        currentSite = 'youtube-desktop';
+        return document.querySelector('.ytp-caption-window-container');
     } else if (hostname === 'm.youtube.com') {
+        currentSite = 'youtube-mobile';
         const mobileSelectors = ['.ytm-timed-text-container', '.caption-window', '.player-timed-text-container'];
-        for(const selector of mobileSelectors) {
-            captionContainer = document.querySelector(selector);
-            if (captionContainer) {
-                site = 'youtube-mobile';
-                break;
-            }
+        for (const selector of mobileSelectors) {
+            const el = document.querySelector(selector);
+            if (el) return el;
         }
     } else if (hostname === 'meet.google.com') {
+        currentSite = 'meet';
         const meetSelectors = ['[jsname="dsdcsc"]', '.a4cQT', '.adErb', '.ADivge[data-is-captions]'];
         for (const selector of meetSelectors) {
-            captionContainer = document.querySelector(selector);
-            if (captionContainer) { site = 'meet'; break; }
+            const el = document.querySelector(selector);
+            if (el) return el;
         }
     }
-    
-    if (captionContainer) {
-        if (overlay) overlay.querySelector('p').textContent = 'Observer active!';
-        
-        mutationObserver = new MutationObserver(() => {
-            clearTimeout(captionDebounceTimer);
-            captionDebounceTimer = setTimeout(() => {
-                let fullTranscript = '';
-                if (site === 'meet') {
-                    const captionElements = captionContainer.querySelectorAll('.ygicle.VbkSUe');
-                    captionElements.forEach(el => { fullTranscript += el.textContent + ' '; });
-                    fullTranscript = fullTranscript.replace(/\s+/g, ' ').trim();
-                } else { // Handles both youtube-desktop and youtube-mobile
-                    fullTranscript = captionContainer.textContent.replace(/\s+/g, ' ').trim();
-                }
+    return null;
+}
 
-                if (fullTranscript === transcriptHistory) return;
-
-                let newText = '';
-                if (fullTranscript.startsWith(transcriptHistory)) {
-                    newText = fullTranscript.substring(transcriptHistory.length);
-                } else {
-                    newText = fullTranscript;
-                }
-                
-                if (newText.trim()) {
-                    processNewText(newText);
-                }
-                
-                transcriptHistory = fullTranscript;
-
-            }, 750); 
-        });
-        mutationObserver.observe(captionContainer, { childList: true, subtree: true, characterData: true });
-        return true;
+function readTranscript(container, site) {
+    if (site === 'meet') {
+        let t = '';
+        container.querySelectorAll('.ygicle.VbkSUe').forEach(el => { t += el.textContent + ' '; });
+        return t.replace(/\s+/g, ' ').trim();
     }
-    return false;
+    // Handles both youtube-desktop and youtube-mobile
+    return container.textContent.replace(/\s+/g, ' ').trim();
+}
+
+function handleTranscript(container, site) {
+    const fullTranscript = readTranscript(container, site);
+    if (!fullTranscript || fullTranscript === transcriptHistory) return;
+
+    let newText = '';
+    if (fullTranscript.startsWith(transcriptHistory)) {
+        newText = fullTranscript.substring(transcriptHistory.length);
+    } else {
+        newText = fullTranscript;
+    }
+
+    if (newText.trim()) {
+        console.log('[Signergy] new caption text:', JSON.stringify(newText.trim()));
+        processNewText(newText);
+    }
+    transcriptHistory = fullTranscript;
+}
+
+function attachObserver(container, site) {
+    if (mutationObserver) mutationObserver.disconnect();
+    observedNode = container;
+
+    if (overlay) {
+        const p = overlay.querySelector('p');
+        if (p && (p.textContent === 'Waiting for captions...' || p.textContent === 'Loading Dictionary...')) {
+            p.textContent = 'Observer active!';
+        }
+    }
+
+    mutationObserver = new MutationObserver(() => {
+        clearTimeout(captionDebounceTimer);
+        captionDebounceTimer = setTimeout(() => handleTranscript(container, site), 750);
+    });
+    mutationObserver.observe(container, { childList: true, subtree: true, characterData: true });
+    console.log('[Signergy] observer attached to caption container:', container);
+
+    // Process any captions already present at attach time.
+    handleTranscript(container, site);
+}
+
+// The caption box is repeatedly torn down and rebuilt by YouTube (and by other
+// player extensions), which would leave a one-shot observer watching a dead node.
+// Poll for the current container and (re)attach whenever it appears or is replaced.
+function startCaptionWatch() {
+    if (captionWatchStarted) return;
+    captionWatchStarted = true;
+
+    setInterval(() => {
+        hookMainVideo();
+        // Reconcile pause state against the video's real state so it can't get stuck.
+        if (mainVideo && mainVideo.paused !== isPaused) {
+            if (mainVideo.paused) onMainPause();
+            else onMainPlay();
+        }
+        const container = findCaptionContainer();
+        if (container && container !== observedNode) {
+            attachObserver(container, currentSite);
+        }
+    }, 1000);
 }
 
 async function main() {
@@ -275,11 +374,7 @@ async function main() {
         
         if (overlay) overlay.querySelector('p').textContent = 'Waiting for captions...';
         
-        const observerInterval = setInterval(() => {
-            if (startObserver()) {
-                clearInterval(observerInterval);
-            }
-        }, 1000);
+        startCaptionWatch();
 
     } catch (error) {
         console.error("Failed to load dictionary:", error);
@@ -302,6 +397,7 @@ browserApi.runtime.onMessage.addListener((request) => {
         overlay = null;
         if (mutationObserver) mutationObserver.disconnect();
         mutationObserver = null;
+        observedNode = null; // Force the watchdog to re-attach to a fresh node
         transcriptHistory = ""; // Reset history on reload
         main();
     }
